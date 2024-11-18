@@ -49,3 +49,7 @@ This repository contains a Memory Leak Detection Tool implemented in C. It provi
 **Error Handling**
 - Handles failures in shared memory initialization or access with descriptive error messages.
 - Automatically removes terminated processes to prevent stale entries.
+
+**Reference** 
+- https://youtu.be/a1_FyEh9Efs?si=HSypwPzPsCLzjQ91
+- https://www.geeksforgeeks.org/ipc-shared-memory/
