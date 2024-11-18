@@ -1,9 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include "../my_mem.h"
 
 void allocateMemoryLeak() {
     // Allocate 1 MB of memory
-    char *buffer = (char *)malloc(1024 * 1024);
+    char *buffer = (char *)my_malloc(1024 * 1024);
     if (buffer == NULL) {
         printf("Memory allocation failed!\n");
         return;

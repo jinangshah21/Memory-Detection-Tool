@@ -9,6 +9,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <semaphore.h>
 
 #define MAX_PROCESSES 1024 
 
@@ -18,15 +20,28 @@ typedef struct {
     char process_name[256];             // Process name
     size_t allocated_size;               // Total allocated size
     size_t deallocated_size;             // Total deallocated size
-    size_t memory_leak;                 // Calculated memory leak
+    size_t memory_leak;                  // Calculated memory leak  
+    int date;
+    int month;
+    int year;
+    int hour;
+    int min;
 } ProcessMemoryInfo;
 
-static ProcessMemoryInfo *process_map = NULL; // Pointer for shared memory of process_map
-static int *process_count = NULL; // Pointer for shared memory to store process count
+static sem_t process_semaphore;
+static ProcessMemoryInfo *process_map = NULL; // Pointers for shared memory
+static int *process_count = NULL;
 
 // Access Shared memory when a new process wants memory
 void initialize_process(){
-    int count_shm_id = shmget(ftok("/tmp/shmfile_count", 64), sizeof(int), IPC_CREAT | 0666);
+    
+    // Semaphore to prevent race conditions
+    if (sem_init(&process_semaphore, 1, 1) < 0) { 
+        perror("sem_init failed");
+        exit(1);
+    }
+    
+    int count_shm_id = shmget(ftok("/tmp/shmfile_count",64), sizeof(int), IPC_CREAT | 0666);
     if (count_shm_id < 0) {
         perror("shmget for process count failed");
         exit(1);
@@ -36,7 +51,7 @@ void initialize_process(){
         perror("shmat for process count failed");
         exit(1);
     }
-    int shm_id = shmget(1234, sizeof(ProcessMemoryInfo) * MAX_PROCESSES, IPC_CREAT | 0666);
+    int shm_id = shmget(12345, sizeof(ProcessMemoryInfo) * MAX_PROCESSES, IPC_CREAT | 0666);
     if (shm_id < 0) {
         perror("shmget for process map failed");
         exit(1);
@@ -48,36 +63,26 @@ void initialize_process(){
     }
 }
 void initialize_memory_tracker() {
-    // Allocate shared memory for the process count
-    int count_shm_id = shmget(ftok("/tmp/shmfile_count", 64), sizeof(int), IPC_CREAT | 0666);
-    if (count_shm_id < 0) {
-        perror("shmget for process count failed");
-        exit(1);
-    }
-    process_count = (int *)shmat(count_shm_id, NULL, 0);
-    if (process_count == (int *)(-1)) {
-        perror("shmat for process count failed");
-        exit(1);
-    }
     *process_count = 0; // Initialize process count to 0
-
-    // Allocate shared memory for the process map
-    int shm_id = shmget(1234, sizeof(ProcessMemoryInfo) * MAX_PROCESSES, IPC_CREAT | 0666);
-    if (shm_id < 0) {
-        perror("shmget for process map failed");
-        exit(1);
-    }
-    process_map = (ProcessMemoryInfo *)shmat(shm_id, NULL, 0);
-    if (process_map == (ProcessMemoryInfo *)(-1)) {
-        perror("shmat for process map failed");
-        exit(1);
-    }
     memset(process_map, 0, sizeof(ProcessMemoryInfo) * MAX_PROCESSES); // Initialize the shared memory
 }
 
-void cleanup_memory_tracker() { // Detaching Shared Memory
+void cleanup_memory_tracker() { // Detaching and Deleting Shared Memory, Semaphore
     if (process_map) shmdt(process_map);  
     if (process_count) shmdt(process_count);
+    
+    int count_shm_id = shmget(ftok("/tmp/shmfile_count", 64), sizeof(int), 0666);
+    if (count_shm_id >= 0) {
+        shmctl(count_shm_id, IPC_RMID, NULL); // Remove process count shared memory
+    }
+    int shm_id = shmget(12345, sizeof(ProcessMemoryInfo) * MAX_PROCESSES, 0666);
+    if (shm_id >= 0) {
+        shmctl(shm_id, IPC_RMID, NULL); // Remove process map shared memory
+    }
+    
+    if (sem_destroy(&process_semaphore) < 0) {
+        perror("sem_destroy failed");
+    }
 }
 
 // Getting name of the binary file 
@@ -118,9 +123,11 @@ void remove_process(pid_t pid) {
 
 // Updating Shared Memory Based on Allocation and Deallocation 
 void update_process_memory(pid_t pid, size_t size, int is_allocated) {
+    sem_wait(&process_semaphore); // Semaphore to prevent Race condition
+    
     ProcessMemoryInfo *process_info = find_process(pid);
     if (process_info == NULL) {
-        if(*process_count == MAX_PROCESSES) {  // If MAX_PROCESSES is reached then we remove data of 1st process
+        if (*process_count == MAX_PROCESSES) {  // If MAX_PROCESSES is reached, remove the first process
             remove_process(process_map[0].pid);
         }
         process_info = &process_map[*process_count];
@@ -128,15 +135,25 @@ void update_process_memory(pid_t pid, size_t size, int is_allocated) {
         get_process_name(pid, process_info->process_name);
         process_info->allocated_size = 0;
         process_info->deallocated_size = 0;
-        (*process_count)++; // Increment Process count
+        (*process_count)++; // Increment process count
     }
+
     // Update allocated or deallocated sizes
     if (is_allocated) {
         process_info->allocated_size += size;
     } else {
         process_info->deallocated_size += size;
     }
+
     process_info->memory_leak = process_info->allocated_size - process_info->deallocated_size;
+    time_t now = time(NULL);              // Getting the current time
+    struct tm *current_time = localtime(&now);
+    process_info->date = current_time->tm_mday;
+    process_info->year = current_time->tm_year + 1900;
+    process_info->month = current_time->tm_mon + 1;
+    process_info->hour = current_time->tm_hour;
+    process_info->min = current_time->tm_min;
+    sem_post(&process_semaphore);
 }
 
 void *my_malloc(size_t size) {
@@ -151,8 +168,8 @@ void *my_malloc(size_t size) {
 
 void my_free(void *ptr, size_t size) {
     if (ptr) {
-        update_process_memory(getpid(), size, 0); // Mark as deallocated
-        free(ptr); 
+        free(ptr);
+        update_process_memory(getpid(), size, 0); // Mark as deallocated 
     }
 }
 
@@ -167,6 +184,7 @@ void *my_realloc(void *ptr, size_t old_size, size_t new_size) {
 }
 
 void *my_calloc(size_t num, size_t size) {
+    if(!process_map) initialize_process();
     size_t total_size = num * size;
     void *ptr = malloc(total_size); 
     if (ptr) {
@@ -178,22 +196,44 @@ void *my_calloc(size_t num, size_t size) {
 }
 
 
-// Monitor UI Output 
+// Monitor Printing
 void print_memory_info() {
-  printf("PID\tProcess Name\tAllocated\tDeallocated\tMemory Leak\n");
-    printf("--------------------------------------------------------\n");
+    printf("PID\tProcess Name\tAllocated (Bytes)\tDeallocated (Bytes)\tMemory Leak \t  Date \t\tTime\n");
+    printf("---------------------------------------------------------------------------------------------------------------------\n");
+
     for (int i = 0; i < *process_count; i++) {
         ProcessMemoryInfo *p = &process_map[i];
         if (p->pid) {
-            printf("%d\t%s \t\t%zu bytes \t%zu bytes \t%zu bytes\n",
-                   p->pid,
-                   p->process_name,
-                   p->allocated_size,
-                   p->deallocated_size,
-                   p->memory_leak);
+            size_t leak = p->memory_leak;
+            double leak_percent = p->allocated_size ? (double)leak / p->allocated_size * 100 : 0;
+
+            // Determine color for memory leak
+            const char *color = "\033[0m"; // Default color
+            if (leak_percent > 50.0) {
+                color = "\033[1;31m"; // Red
+            } else if (leak_percent > 10.0) {
+                color = "\033[1;33m"; // Yellow
+            } else {
+                color = "\033[1;32m"; // Green
+            }
+
+            // Use fixed-width formatting while wrapping the memory leak column with the color
+            printf("%d\t%-15s\t%-20zu\t%-20zu\t%s%-zu (%.2f%%)\033[0m\t %02d-%02d-%04d\t%02d:%02d\n",
+                     p->pid,                     // PID
+                     p->process_name,            // Process name
+                     p->allocated_size,          // Allocated memory
+                     p->deallocated_size,        // Deallocated memory
+                     color,                      // Color start
+                     p->memory_leak,             // Memory leak value
+                     leak_percent,               // Memory leak percentage
+                     p->date,                     // Day
+                     p->month,                   // Month
+                     p->year,                    // Year
+                     p->hour,                    // Hour
+                     p->min);                    // Minute
         }
     }
-    printf("\n"); 
+    printf("\n");
 }
 
 #endif 
